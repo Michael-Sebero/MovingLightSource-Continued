@@ -44,8 +44,13 @@ public class EventHandler
     // Track which EntityItem "owns" each light block position
     private static final Map<BlockPos, Integer> itemLightBlockOwnership = new HashMap<>();
     
-    // Throttle for dropped items
+    // Cache for projectile lights (arrows, fireballs, etc.)
+    private static final Map<Integer, BlockPos> lastProjectileLightBlockPos = new HashMap<>();
+    private static final Map<BlockPos, Integer> projectileLightBlockOwnership = new HashMap<>();
+    
+    // Throttle for dropped items and projectiles
     private static final int ITEM_LIGHT_UPDATE_INTERVAL = 2;
+    private static final int PROJECTILE_LIGHT_UPDATE_INTERVAL = 1; // Update every tick for fast movement
     
     @SubscribeEvent(priority=EventPriority.NORMAL, receiveCanceled=true)
     public void onEvent(RegistryEvent.NewRegistry event)
@@ -88,28 +93,57 @@ public class EventHandler
         // Only process on server side at end of tick
         if (event.phase != TickEvent.Phase.END || event.world.isRemote) return;
         
-        // Only process if feature is enabled
-        if (!MainMod.allowEntityItemsToGiveOffLight) return;
-        
-        // Throttle updates
-        if (event.world.getTotalWorldTime() % ITEM_LIGHT_UPDATE_INTERVAL != 0) return;
-        
-        // Track which entity IDs we've seen this tick
-        Map<Integer, Boolean> seenItems = new HashMap<>();
-        
-        // Process all loaded entities
-        for (Entity entity : event.world.loadedEntityList)
+        // Create a copy of the entity list to avoid ConcurrentModificationException
+        List<Entity> entityListCopy;
+        try
         {
-            if (entity instanceof EntityItem)
-            {
-                EntityItem entityItem = (EntityItem) entity;
-                seenItems.put(entityItem.getEntityId(), true);
-                handleEntityItemLight(entityItem);
-            }
+            entityListCopy = new java.util.ArrayList<>(event.world.loadedEntityList);
+        }
+        catch (Exception e)
+        {
+            // If we can't copy the list, skip this tick
+            return;
         }
         
-        // Clean up lights for items that no longer exist
-        cleanupOrphanedItemLights(event.world, seenItems);
+        // Handle EntityItem lights if enabled
+        if (MainMod.allowEntityItemsToGiveOffLight && 
+            event.world.getTotalWorldTime() % ITEM_LIGHT_UPDATE_INTERVAL == 0)
+        {
+            Map<Integer, Boolean> seenItems = new HashMap<>();
+            
+            for (Entity entity : entityListCopy)
+            {
+                if (entity instanceof EntityItem)
+                {
+                    EntityItem entityItem = (EntityItem) entity;
+                    seenItems.put(entityItem.getEntityId(), true);
+                    handleEntityItemLight(entityItem);
+                }
+            }
+            
+            cleanupOrphanedItemLights(event.world, seenItems);
+        }
+        
+        // Handle burning projectile lights if enabled
+        if (MainMod.allowBurningEntitiesToGiveOffLight && 
+            event.world.getTotalWorldTime() % PROJECTILE_LIGHT_UPDATE_INTERVAL == 0)
+        {
+            Map<Integer, Boolean> seenProjectiles = new HashMap<>();
+            
+            for (Entity entity : entityListCopy)
+            {
+                // Check if it's a projectile (not living, not item) and burning
+                if (!(entity instanceof EntityLivingBase) && 
+                    !(entity instanceof EntityItem) && 
+                    entity.isBurning())
+                {
+                    seenProjectiles.put(entity.getEntityId(), true);
+                    handleBurningProjectileLight(entity);
+                }
+            }
+            
+            cleanupOrphanedProjectileLights(event.world, seenProjectiles);
+        }
     }
     
     /**
@@ -157,6 +191,40 @@ public class EventHandler
     }
     
     /**
+     * Clean up light blocks for projectiles that no longer exist
+     */
+    private void cleanupOrphanedProjectileLights(World world, Map<Integer, Boolean> seenProjectiles)
+    {
+        Iterator<Map.Entry<Integer, BlockPos>> iterator = lastProjectileLightBlockPos.entrySet().iterator();
+        
+        while (iterator.hasNext())
+        {
+            Map.Entry<Integer, BlockPos> entry = iterator.next();
+            int entityId = entry.getKey();
+            
+            if (!seenProjectiles.containsKey(entityId))
+            {
+                BlockPos pos = entry.getValue();
+                if (pos != null)
+                {
+                    Block block = world.getBlockState(pos).getBlock();
+                    if (block instanceof BlockMovingLightSource)
+                    {
+                        Integer owner = projectileLightBlockOwnership.get(pos);
+                        if (owner != null && owner == entityId)
+                        {
+                            world.setBlockToAir(pos);
+                            projectileLightBlockOwnership.remove(pos);
+                        }
+                    }
+                }
+                
+                iterator.remove();
+            }
+        }
+    }
+    
+    /**
      * Handle lighting for a single EntityItem
      */
     private void handleEntityItemLight(EntityItem entityItem)
@@ -178,6 +246,118 @@ public class EventHandler
         {
             // Item doesn't emit light - remove any existing light block
             removeItemLight(entityItem);
+        }
+    }
+    
+    /**
+     * Handle lighting for burning projectiles (arrows, fireballs, etc.)
+     */
+    private void handleBurningProjectileLight(Entity projectile)
+    {
+        if (projectile == null || projectile.isDead || !projectile.isBurning()) 
+        {
+            removeProjectileLight(projectile);
+            return;
+        }
+        
+        placeProjectileLight(projectile, BlockRegistry.MOVING_LIGHT_SOURCE_15);
+    }
+    
+    /**
+     * Place light block for burning projectile
+     */
+    private void placeProjectileLight(Entity projectile, Block lightBlock)
+    {
+        int entityId = projectile.getEntityId();
+        World world = projectile.world;
+        
+        // Determine projectile position
+        int blockX = MathHelper.floor(projectile.posX);
+        int blockY = MathHelper.floor(projectile.posY);
+        int blockZ = MathHelper.floor(projectile.posZ);
+        
+        // Try positions: at projectile location and one block up
+        BlockPos[] positionsToTry = {
+            new BlockPos(blockX, blockY, blockZ),
+            new BlockPos(blockX, blockY + 1, blockZ)
+        };
+        
+        BlockPos lastPos = lastProjectileLightBlockPos.get(entityId);
+        BlockPos targetPos = null;
+        
+        // Find a valid position to place the light
+        for (BlockPos pos : positionsToTry)
+        {
+            Block blockAtLocation = world.getBlockState(pos).getBlock();
+            
+            if (blockAtLocation == Blocks.AIR || blockAtLocation instanceof BlockMovingLightSource)
+            {
+                targetPos = pos;
+                break;
+            }
+        }
+        
+        // If no valid position found, keep trying
+        if (targetPos == null)
+        {
+            return;
+        }
+        
+        // Remove old light block if projectile moved to a different position
+        if (lastPos != null && !lastPos.equals(targetPos))
+        {
+            removeProjectileLightAtPos(world, lastPos, entityId);
+        }
+        
+        // Check if light already exists at target position
+        Block blockAtLocation = world.getBlockState(targetPos).getBlock();
+        
+        if (blockAtLocation == Blocks.AIR)
+        {
+            // Empty space - place light block without tile entity
+            world.setBlockState(targetPos, lightBlock.getDefaultState(), 3);
+            lastProjectileLightBlockPos.put(entityId, targetPos);
+            projectileLightBlockOwnership.put(targetPos, entityId);
+        }
+        else if (blockAtLocation instanceof BlockMovingLightSource)
+        {
+            // Already a light block - just update cache to maintain ownership
+            lastProjectileLightBlockPos.put(entityId, targetPos);
+            projectileLightBlockOwnership.put(targetPos, entityId);
+        }
+    }
+    
+    /**
+     * Remove light block for projectile
+     */
+    private void removeProjectileLight(Entity projectile)
+    {
+        if (projectile == null) return;
+        
+        int entityId = projectile.getEntityId();
+        BlockPos lastPos = lastProjectileLightBlockPos.get(entityId);
+        
+        if (lastPos != null)
+        {
+            removeProjectileLightAtPos(projectile.world, lastPos, entityId);
+            lastProjectileLightBlockPos.remove(entityId);
+        }
+    }
+    
+    /**
+     * Remove projectile light block at specific position
+     */
+    private void removeProjectileLightAtPos(World world, BlockPos pos, int entityId)
+    {
+        Block block = world.getBlockState(pos).getBlock();
+        if (block instanceof BlockMovingLightSource)
+        {
+            Integer owner = projectileLightBlockOwnership.get(pos);
+            if (owner == null || owner == entityId)
+            {
+                world.setBlockToAir(pos);
+                projectileLightBlockOwnership.remove(pos);
+            }
         }
     }
     
@@ -329,38 +509,10 @@ public class EventHandler
     @SubscribeEvent(priority=EventPriority.NORMAL, receiveCanceled=true)
     public void onEvent(PlayerTickEvent event)
     {        
-        // Handle client-side version check
-        if (event.phase == TickEvent.Phase.START && event.player.world.isRemote)
-        {
-            handleVersionCheck(event.player);
-            return;
-        }
-        
         // Handle server-side light placement
         if (event.phase == TickEvent.Phase.START && !event.player.world.isRemote)
         {
             handlePlayerLightPlacement(event.player);
-        }
-    }
-    
-    /**
-     * Handle version checking and warning display
-     */
-    private void handleVersionCheck(EntityPlayer player)
-    {
-        if (!MainMod.haveWarnedVersionOutOfDate && !MainMod.versionChecker.isLatestVersion())
-        {
-            ClickEvent clickEvent = new ClickEvent(
-                ClickEvent.Action.OPEN_URL, 
-                "http://michaelsebero.blogspot.com"
-            );
-            Style clickableStyle = new Style().setClickEvent(clickEvent);
-            TextComponentString message = new TextComponentString(
-                "Your Moving Light Source Mod is not the latest version! Click here to update."
-            );
-            message.setStyle(clickableStyle);
-            player.sendMessage(message);
-            MainMod.haveWarnedVersionOutOfDate = true;
         }
     }
     
@@ -489,6 +641,8 @@ public class EventHandler
             lastItemLightBlockPos.clear();
             lastItemLightBlockType.clear();
             itemLightBlockOwnership.clear();
+            lastProjectileLightBlockPos.clear();
+            projectileLightBlockOwnership.clear();
             BlockMovingLightSource.clearCache();
         }
     }
